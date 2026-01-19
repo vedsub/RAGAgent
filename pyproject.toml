@@ -11,7 +11,9 @@ dependencies = [
     "langchain>=1.2.6",
     "langchain-community>=0.4.1",
     "langchain-core>=1.2.7",
+    "langchain-groq>=1.1.1",
     "pymupdf>=1.26.7",
     "pypdf>=6.6.0",
+    "python-dotenv>=1.2.1",
     "sentence-transformers>=5.2.0",
 ]
