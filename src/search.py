@@ -5,6 +5,9 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.messages import HumanMessage, SystemMessage
 from dotenv import load_dotenv
 
+from .observability import get_logger
+from .llm_observability import get_llm_wrapper
+
 load_dotenv()
 
 
@@ -21,6 +24,9 @@ class RAGSearch:
         """
         self.vector_store = vector_store
         self.embedding_manager = embedding_manager
+        self.logger = get_logger()
+        self.llm_wrapper = get_llm_wrapper()
+        self.obs_manager = self.llm_wrapper.obs_manager
 
         # Initialize Groq LLM
         api_key = os.getenv("GROQ_API_KEY")
@@ -63,44 +69,88 @@ Answer:""",
         Returns:
             Generated answer/summary
         """
-        # Use provided vector store or instance default
-        store = vector_store or self.vector_store
-        if store is None:
-            return "No vector store available for search"
+        with self.llm_wrapper.observe_rag_pipeline(
+            "search_and_summarize", query
+        ) as ctx:
+            request_id = ctx["request_id"]
 
-        # Retrieve relevant documents
-        try:
-            results = store.query(query, top_k=top_k)
-        except Exception as e:
-            return f"Error during search: {e}"
+            # Use provided vector store or instance default
+            store = vector_store or self.vector_store
+            if store is None:
+                self.logger.warning("No vector store available", request_id=request_id)
+                return "No vector store available for search"
 
-        if not results:
-            return "No relevant documents found for the query"
+            # Retrieve relevant documents with observability
+            try:
+                with self.llm_wrapper.observe_vector_store_operation(
+                    "query", top_k=top_k
+                ) as vec_ctx:
+                    results = store.query(query, top_k=top_k)
+                    vec_ctx["results_count"] = len(results) if results else 0
 
-        # Combine document content
-        context = "\n\n".join(
-            [
-                f"Document {i + 1}: {result['content']}"
-                for i, result in enumerate(results)
-            ]
-        )
+                self.obs_manager.record_rag_retrieval(
+                    num_results=len(results) if results else 0,
+                    latency=0,  # Will be updated by wrapper
+                )
 
-        # Generate answer using LLM
-        try:
-            # Format prompt
-            prompt_text = self.prompt_template.format(context=context, question=query)
+            except Exception as e:
+                self.logger.error(
+                    "Vector store query failed",
+                    request_id=request_id,
+                    error=str(e),
+                    exc_info=True,
+                )
+                return f"Error during search: {e}"
 
-            # Generate response
-            response = self.llm.invoke(
+            if not results:
+                self.logger.info("No relevant documents found", request_id=request_id)
+                return "No relevant documents found for the query"
+
+            # Combine document content
+            context = "\n\n".join(
                 [
-                    SystemMessage(
-                        content="You are a helpful assistant that answers questions based on provided context."
-                    ),
-                    HumanMessage(content=prompt_text),
+                    f"Document {i + 1}: {result['content']}"
+                    for i, result in enumerate(results)
                 ]
             )
 
-            return response.content
+            # Generate answer using LLM with observability
+            @self.llm_wrapper.observe_llm_generation(
+                model_name="llama-3.3-70b-versatile"
+            )
+            def _generate_answer():
+                # Format prompt
+                prompt_text = self.prompt_template.format(
+                    context=context, question=query
+                )
 
-        except Exception as e:
-            return f"Error generating answer: {e}"
+                # Generate response
+                response = self.llm.invoke(
+                    [
+                        SystemMessage(
+                            content="You are a helpful assistant that answers questions based on provided context."
+                        ),
+                        HumanMessage(content=prompt_text),
+                    ]
+                )
+
+                return response.content
+
+            try:
+                self.logger.info(
+                    "Generating answer",
+                    request_id=request_id,
+                    context_length=len(context),
+                    top_k=top_k,
+                )
+
+                return _generate_answer()
+
+            except Exception as e:
+                self.logger.error(
+                    "LLM generation failed",
+                    request_id=request_id,
+                    error=str(e),
+                    exc_info=True,
+                )
+                return f"Error generating answer: {e}"

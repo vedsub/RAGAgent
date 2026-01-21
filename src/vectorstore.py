@@ -1,11 +1,14 @@
 import os
 import pickle
+import time
 import numpy as np
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 import faiss
 from langchain_core.documents import Document
 from src.embedding import EmbeddingManager
+from src.observability import get_logger
+from src.llm_observability import get_llm_wrapper
 
 
 class FaissVectorStore:
@@ -18,7 +21,7 @@ class FaissVectorStore:
         Initialize FAISS vector store
 
         Args:
-            store_path: Path to store/load the FAISS index
+            store_path: Path to store/load FAISS index
             embedding_manager: EmbeddingManager instance (creates default if None)
         """
         self.store_path = Path(store_path)
@@ -27,6 +30,9 @@ class FaissVectorStore:
         self.index = None
         self.documents = []
         self.metadata = []
+        self.logger = get_logger()
+        self.llm_wrapper = get_llm_wrapper()
+        self.obs_manager = self.llm_wrapper.obs_manager
 
     def build_from_documents(self, documents: List[Document]):
         """
@@ -116,35 +122,64 @@ class FaissVectorStore:
             List of dictionaries with document content, metadata, and similarity scores
         """
         if self.index is None:
-            print("No index available for querying")
+            self.logger.warning("Query attempted with no index available")
             return []
 
-        # Generate query embedding
-        query_embedding = self.embedding_manager.generate_embeddings([query_text])[0]
+        # Add observability to query operation
+        with self.llm_wrapper.observe_vector_store_operation(
+            "query", top_k=top_k, query_length=len(query_text)
+        ) as ctx:
+            # Generate query embedding
+            embedding_start = time.time()
+            query_embedding = self.embedding_manager.generate_embeddings([query_text])[
+                0
+            ]
+            embedding_time = time.time() - embedding_start
 
-        # Normalize for cosine similarity
-        query_embedding = query_embedding / np.linalg.norm(query_embedding)
-        query_embedding = query_embedding.reshape(1, -1)
+            self.logger.debug(
+                "Query embedding generated",
+                query_length=len(query_text),
+                embedding_time_seconds=embedding_time,
+            )
 
-        # Search
-        similarities, indices = self.index.search(
-            query_embedding, min(top_k, len(self.documents))
-        )
+            # Normalize for cosine similarity
+            query_embedding = query_embedding / np.linalg.norm(query_embedding)
+            query_embedding = query_embedding.reshape(1, -1)
 
-        results = []
-        for i, (similarity, idx) in enumerate(zip(similarities[0], indices[0])):
-            if idx >= 0 and idx < len(self.documents):
-                results.append(
-                    {
-                        "content": self.documents[idx].page_content,
-                        "metadata": self.metadata[idx],
-                        "similarity_score": float(similarity),
-                        "rank": i + 1,
-                        "id": f"doc_{idx}",
-                    }
-                )
+            # Search
+            search_start = time.time()
+            similarities, indices = self.index.search(
+                query_embedding, min(top_k, len(self.documents))
+            )
+            search_time = time.time() - search_start
 
-        return results
+            results = []
+            for i, (similarity, idx) in enumerate(zip(similarities[0], indices[0])):
+                if idx >= 0 and idx < len(self.documents):
+                    results.append(
+                        {
+                            "content": self.documents[idx].page_content,
+                            "metadata": self.metadata[idx],
+                            "similarity_score": float(similarity),
+                            "rank": i + 1,
+                            "id": f"doc_{idx}",
+                        }
+                    )
+
+            ctx["results_count"] = len(results)
+            ctx["embedding_time_seconds"] = embedding_time
+            ctx["search_time_seconds"] = search_time
+
+            self.logger.debug(
+                "Vector store query completed",
+                top_k=top_k,
+                results_returned=len(results),
+                embedding_time_seconds=embedding_time,
+                search_time_seconds=search_time,
+                avg_similarity=np.mean(similarities[0]) if similarities.any() else 0,
+            )
+
+            return results
 
     def __len__(self):
         """Return number of documents in store"""
